@@ -311,6 +311,11 @@ func (t *ClientTunnel) isConnectionHealthy() bool {
 		return false
 	}
 
+	// 检查连接是否因连续错误被标记为不健康
+	if t.hysteriaRelay.unhealthy.Load() {
+		return false
+	}
+
 	return true
 }
 

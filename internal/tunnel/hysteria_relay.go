@@ -26,9 +26,13 @@ type HysteriaUDPRelay struct {
 	hyClient client.Client
 	udpConn  client.HyUDPConn
 
-	mu     sync.RWMutex
-	closed atomic.Bool
+	mu        sync.RWMutex
+	closed    atomic.Bool
+	unhealthy atomic.Bool  // 标记连接是否不健康
+	errCount  atomic.Int32 // 连续错误计数
 }
+
+const maxConsecutiveErrors = 5 // 连续错误阈值
 
 // NewHysteriaUDPRelay 创建 Hysteria UDP 中继
 func NewHysteriaUDPRelay(cfg *config.ClientConfig, logger *slog.Logger) (*HysteriaUDPRelay, error) {
@@ -155,9 +159,17 @@ func (r *HysteriaUDPRelay) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 
 	err = r.udpConn.Send(b, addr.String())
 	if err != nil {
+		// 增加错误计数
+		count := r.errCount.Add(1)
+		if count >= maxConsecutiveErrors && !r.unhealthy.Load() {
+			r.unhealthy.Store(true)
+			r.logger.Warn("Connection marked as unhealthy after consecutive errors", "count", count)
+		}
 		return 0, err
 	}
 
+	// 成功发送，重置错误计数
+	r.errCount.Store(0)
 	return len(b), nil
 }
 
