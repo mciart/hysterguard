@@ -46,7 +46,7 @@ func (e *ServerEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
 // NewHysteriaServerBind 创建服务端绑定
 func NewHysteriaServerBind() *HysteriaServerBind {
 	return &HysteriaServerBind{
-		recvChan: make(chan *serverPacket, 256),
+		recvChan: make(chan *serverPacket, 1024), // 调整为 1024 (约1.5MB)，避免 Bufferbloat 导致 BBR 降速
 		closed:   atomic.Bool{},
 	}
 }
@@ -92,7 +92,7 @@ func (b *HysteriaServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, erro
 	b.mu.Lock()
 	// 重新创建 channel（如果之前被关闭）
 	if b.recvChan == nil {
-		b.recvChan = make(chan *serverPacket, 256)
+		b.recvChan = make(chan *serverPacket, 1024)
 	}
 	b.closed.Store(false)
 	ch := b.recvChan
@@ -103,18 +103,35 @@ func (b *HysteriaServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, erro
 			return 0, net.ErrClosed
 		}
 
-		// 从通道接收数据包
+		// 1. 阻塞读取第一个包
 		pkt, ok := <-ch
 		if !ok {
 			return 0, net.ErrClosed
 		}
 
-		// 复制数据
 		n = copy(packets[0], pkt.data)
 		sizes[0] = n
 		eps[0] = &ServerEndpoint{addr: pkt.endpoint}
+		count := 1
 
-		return 1, nil
+		// 2. 尝试非阻塞读取更多包 (Batch Processing)
+		for count < len(packets) {
+			select {
+			case pkt, ok := <-ch:
+				if !ok {
+					return count, nil
+				}
+				n = copy(packets[count], pkt.data)
+				sizes[count] = n
+				eps[count] = &ServerEndpoint{addr: pkt.endpoint}
+				count++
+			default:
+				// 通道空了，直接返回已读取的包
+				return count, nil
+			}
+		}
+
+		return count, nil
 	}
 
 	return []conn.ReceiveFunc{recvFunc}, 0, nil
@@ -176,5 +193,5 @@ func (b *HysteriaServerBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 
 // BatchSize 实现 Bind.BatchSize
 func (b *HysteriaServerBind) BatchSize() int {
-	return 1
+	return conn.IdealBatchSize
 }
