@@ -1,0 +1,61 @@
+# HysterGuard 服务端配置示例
+
+# 监听地址
+listen: ":443"
+
+# Hysteria 配置
+hysteria:
+  # 认证密码（与客户端配置相同）
+  auth: "your-password-here"
+  
+  # TLS 证书（用于 QUIC）
+  tls:
+    cert: "/path/to/cert.pem"
+    key: "/path/to/key.pem"
+  
+  # 混淆配置
+  obfs:
+    type: salamander
+    password: "obfs-password-here"
+  
+  # 伪装网站（用于应对主动探测）
+  masquerade:
+    type: proxy
+    proxy:
+      url: "https://www.microsoft.com"
+      rewrite_host: true
+
+# WireGuard 配置
+wireguard:
+  # 服务端私钥（使用 wg genkey 生成）
+  private_key: "SERVER_PRIVATE_KEY_HERE"
+  
+  # 监听端口（仅用于配置，All-in-One 模式不实际监听）
+  listen_port: 51820
+  
+  # 客户端配置
+  peers:
+    - public_key: "CLIENT_PUBLIC_KEY_HERE"
+      allowed_ips:
+        - "10.0.0.2/32"
+        - "fd00::2/128"
+
+  # 服务端 IP 地址
+  address:
+    ipv4: "10.0.0.1/24"
+    ipv6: "fd00::1/64"
+  
+  # 接口启动后执行的命令（可选）
+  # post_up:
+  #   - "ip -4 rule add from 服务器公网IP lookup main"
+  #   - "iptables -A FORWARD -i wg0 -j ACCEPT"
+  
+  # 接口关闭前执行的命令（可选）
+  # post_down:
+  #   - "ip -4 rule delete from 服务器公网IP lookup main"
+  #   - "iptables -D FORWARD -i wg0 -j ACCEPT"
+
+# 日志配置
+log:
+  level: "info"
+  file: ""

@@ -1,0 +1,36 @@
+# 编译输出
+build/
+*.exe
+client
+server
+client-*
+server-*
+
+# Go
+*.o
+*.a
+*.so
+go.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 日志
+*.log
+
+# 配置文件（包含敏感信息）
+configs/client.yaml
+configs/server.yaml
+
+# 临时文件
+tmp/
+temp/

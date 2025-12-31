@@ -1,0 +1,73 @@
+# HysterGuard 客户端配置示例
+
+# Hysteria 外层传输配置
+hysteria:
+  # 服务器地址
+  server: "example.com:443"
+  
+  # 认证密码
+  auth: "your-password-here"
+  
+  # TLS SNI（用于伪装）
+  sni: "www.microsoft.com"
+  
+  # 是否跳过证书验证（生产环境不建议）
+  insecure: false
+  
+  # 混淆配置
+  obfs:
+    type: salamander
+    password: "obfs-password-here"
+  
+  # 带宽配置（可选，不配置则自动探测）
+  # bandwidth:
+  #   up: "50 mbps"
+  #   down: "200 mbps"
+
+# WireGuard 内层隧道配置
+wireguard:
+  # 客户端私钥（使用 wg genkey 生成）
+  private_key: "YOUR_PRIVATE_KEY_HERE"
+  
+  # 服务端公钥
+  peer:
+    public_key: "SERVER_PUBLIC_KEY_HERE"
+    # 允许的 IP 范围（0.0.0.0/0 表示所有流量）
+    allowed_ips:
+      - "0.0.0.0/0"
+      - "::/0"
+    # 保持连接间隔（秒）
+    persistent_keepalive: 25
+
+# TUN 设备配置
+tun:
+  # 设备名称
+  name: "hysterguard0"
+  
+  # MTU（建议设置较小值以适应封装开销）
+  mtu: 1280
+  
+  # 客户端 IP 地址
+  address:
+    ipv4: "10.0.0.2/24"
+    ipv6: "fd00::2/64"
+  
+  # DNS 服务器配置（VPN 连接时使用这些 DNS）
+  dns:
+    servers:
+      - "8.8.8.8"        # Google DNS
+      - "1.1.1.1"        # Cloudflare DNS
+      - "2001:4860:4860::8888"  # Google IPv6 DNS
+  
+  # 接口启动后执行的命令（可选）
+  # post_up:
+  #   - "echo 'VPN connected' >> /var/log/vpn.log"
+  
+  # 接口关闭前执行的命令（可选）
+  # post_down:
+  #   - "echo 'VPN disconnected' >> /var/log/vpn.log"
+
+# 日志配置
+log:
+  level: "info"  # debug, info, warn, error
+  file: ""       # 留空则输出到 stdout
