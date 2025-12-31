@@ -1,0 +1,161 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.21'
+  WINTUN_VERSION: '0.14.1'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download Wintun DLL
+        run: |
+          mkdir -p internal/wintun
+          curl -sSL "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip" -o wintun.zip
+          unzip -q wintun.zip
+          cp wintun/bin/amd64/wintun.dll internal/wintun/wintun_amd64.dll
+          cp wintun/bin/arm64/wintun.dll internal/wintun/wintun_arm64.dll
+          rm -rf wintun wintun.zip
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build all platforms
+        run: |
+          mkdir -p dist
+          
+          # Build matrix
+          PLATFORMS=(
+            "linux/amd64"
+            "linux/arm64"
+            "linux/arm"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+          
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            GOOS="${PLATFORM%/*}"
+            GOARCH="${PLATFORM#*/}"
+            
+            # Client
+            CLIENT_NAME="hysterguard-client-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              CLIENT_NAME="${CLIENT_NAME}.exe"
+            fi
+            echo "Building $CLIENT_NAME..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" -o "dist/$CLIENT_NAME" ./cmd/client
+            
+            # Server
+            SERVER_NAME="hysterguard-server-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              SERVER_NAME="${SERVER_NAME}.exe"
+            fi
+            echo "Building $SERVER_NAME..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" -o "dist/$SERVER_NAME" ./cmd/server
+          done
+          
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hysterguard-${{ steps.version.outputs.version }}
+          path: dist/
+          retention-days: 7
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hysterguard-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  prerelease:
+    name: Pre-release (Dev Build)
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hysterguard-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Delete old pre-release
+        uses: dev-drprasad/delete-older-releases@v0.3.2
+        with:
+          keep_latest: 0
+          delete_tag_pattern: dev
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Pre-release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: dev
+          name: "Development Build"
+          body: |
+            ⚠️ **This is an automated development build from the latest main branch.**
+            
+            - Commit: ${{ github.sha }}
+            - Built at: ${{ github.event.head_commit.timestamp }}
+            
+            **Not recommended for production use.**
+          files: dist/*
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
