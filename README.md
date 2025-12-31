@@ -13,18 +13,22 @@
 - ✅ **跨平台**: 支持 Linux / macOS / Windows
 - ✅ **自动路由**: 自动配置系统路由和 DNS
 - ✅ **IPv6 支持**: 完整的双栈支持
+- ✅ **Windows 原生**: 内嵌 Wintun 驱动，无需额外安装
 
-## 功能对比 (vs原版 WireGuard)
+## 下载
 
-| 功能特性 | 原版 WireGuard | HysterGuard (本客户端) | 说明 |
-| :--- | :--- | :--- | :--- |
-| **核心协议** | WireGuard (UDP) | Hysteria 2 (UDP/QUIC) + WireGuard | 核心区别。原版弱网性能差；HysterGuard 抗丢包、速度快。 |
-| **Linux 路由** | FwMark (table 51820) | FwMark (table 51820) | **完全一致**。都使用标准策略路由，此时支持 `ip rule` 绕过 VPN。 |
-| **macOS 路由** | NetworkExtension 或 `route` | `route` 命令 | HysterGuard 使用简单的 `route` 命令，功能与 wg-quick 的 bash 实现类似。 |
-| **Windows 路由** | Wintun 驱动 | Wintun 驱动 | HysterGuard Windows 版已使用 Wintun 驱动。 |
-| **PostUp/Down** | 支持 (任意命令) | 支持 (任意命令) | 功能一致。 |
-| **MTU 自动** | 自动发现 | 手动/默认 1280 | Hysteria 封装开销较大，建议设低一些 (1280 是安全值)。 |
-| **抗探测/混淆** | 无 (纯静态流量特征) | 强 (Salamander/Masquerade) | HysterGuard 很难被防火墙识别。 |
+从 [GitHub Releases](https://github.com/hysterguard/hysterguard/releases) 下载预编译的二进制文件。
+
+| 平台 | 客户端 | 服务端 |
+|------|--------|--------|
+| Linux x86_64 | `hysterguard-client-linux-amd64` | `hysterguard-server-linux-amd64` |
+| Linux ARM64 | `hysterguard-client-linux-arm64` | `hysterguard-server-linux-arm64` |
+| macOS x86_64 | `hysterguard-client-darwin-amd64` | - |
+| macOS ARM64 | `hysterguard-client-darwin-arm64` | - |
+| Windows x64 | `hysterguard-client-windows-amd64.exe` | - |
+| Windows ARM64 | `hysterguard-client-windows-arm64.exe` | - |
+
+> **注意**: 服务端目前仅支持 Linux。
 
 ## 架构
 
@@ -44,21 +48,7 @@
 
 ## 快速开始
 
-### 1. 编译
-
-```bash
-cd hysterguard
-
-# 编译所有平台
-./scripts/build.sh all
-
-# 或只编译当前平台
-./scripts/build.sh current
-```
-
-编译产物在 `build/output/` 目录。
-
-### 2. 生成密钥对
+### 1. 生成密钥对
 
 ```bash
 # 服务端
@@ -68,15 +58,13 @@ wg genkey | tee server_private.key | wg pubkey > server_public.key
 wg genkey | tee client_private.key | wg pubkey > client_public.key
 ```
 
-### 3. 服务端配置
+### 2. 服务端配置
 
 创建 `server.yaml`:
 
 ```yaml
-# 外部监听地址
 listen: ":8443"
 
-# Hysteria 配置
 hysteria:
   auth: "your-password"
   tls:
@@ -86,10 +74,8 @@ hysteria:
     type: salamander
     password: "obfs-password"
 
-# WireGuard 配置
 wireguard:
   private_key: "<服务端私钥>"
-  listen_port: 51820  # 仅用于配置，不实际监听
   address:
     ipv4: "10.10.0.1/24"
     ipv6: "fd00::1/64"
@@ -100,25 +86,20 @@ wireguard:
         - "fd00::2/128"
 ```
 
-### 4. 客户端配置
+### 3. 客户端配置
 
 创建 `client.yaml`:
 
 ```yaml
-# Hysteria 配置
 hysteria:
   server: "your-server.com:8443"
   auth: "your-password"
-  sni: "www.microsoft.com"  # TLS SNI 伪装
+  sni: "www.microsoft.com"
   insecure: false
   obfs:
     type: salamander
     password: "obfs-password"
-  # bandwidth:  # 可选，不配置则自动探测
-  #   up: "50 mbps"
-  #   down: "200 mbps"
 
-# WireGuard 配置
 wireguard:
   private_key: "<客户端私钥>"
   peer:
@@ -128,7 +109,6 @@ wireguard:
       - "::/0"
     persistent_keepalive: 25
 
-# TUN 设备配置
 tun:
   name: "hysterguard0"
   mtu: 1280
@@ -141,137 +121,25 @@ tun:
       - "8.8.4.4"
 ```
 
-### 5. 运行
+### 4. 运行
+
+**Linux/macOS (需要 root 权限):**
+```bash
+sudo ./hysterguard-server-linux-amd64 -c server.yaml
+sudo ./hysterguard-client-darwin-arm64 -c client.yaml
+```
+
+**Windows (需要管理员权限):**
+```powershell
+# 右键"以管理员身份运行"
+.\hysterguard-client-windows-amd64.exe -c client.yaml
+```
+
+### 5. 验证
 
 ```bash
-# 服务端 (需要 root 权限)
-sudo ./server-linux-amd64 -c server.yaml
-
-# 客户端 (需要 root 权限)
-sudo ./client-darwin-arm64 -c client.yaml
-```
-
-### 6. 验证
-
-```bash
-# 检查 IP
-curl ip.sb
-
-# 检查 IPv6
-curl -6 ip.sb
-```
-
-## 配置详解
-
-### 带宽配置
-
-带宽配置是可选的。如果不指定，Hysteria 2 会自动探测最佳带宽：
-
-```yaml
-hysteria:
-  # 方式 1: 不配置，使用自动带宽
-  # bandwidth: 省略
-
-  # 方式 2: 手动指定
-  bandwidth:
-    up: "50 mbps"      # 上传带宽
-    down: "200 mbps"   # 下载带宽
-```
-
-支持的单位: `bps`, `kbps`, `mbps`, `gbps`
-
-### DNS 配置
-
-连接 VPN 后自动配置 DNS：
-
-```yaml
-tun:
-  dns:
-    servers:
-      - "8.8.8.8"        # Google DNS
-      - "1.1.1.1"        # Cloudflare DNS
-      - "2001:4860:4860::8888"  # IPv6 DNS
-```
-
-断开连接后自动恢复原始 DNS。
-
-### PostUp/PostDown 钩子
-
-在 TUN 接口启动后/关闭前执行自定义命令：
-
-```yaml
-tun:
-  post_up:
-    - "ip -4 rule add from 服务器公网IP lookup main"
-    - "echo 'VPN connected' >> /var/log/vpn.log"
-  post_down:
-    - "ip -4 rule delete from 服务器公网IP lookup main"
-```
-
-**常见用途**:
-- 添加策略路由（保持 SSH 连接）
-- 设置防火墙规则
-- 记录日志
-
-> **注意**: `ip rule` 命令仅适用于 Linux。
-> - **macOS**: 使用 `route` 命令添加静态路由 (例如: `route -n add -net <目标IP> <网关IP>`)。
-> - **Windows**: 使用 `route` 命令 (例如: `route add <目标IP> <网关IP>`)。
-
-### TLS 证书
-
-服务端需要有效的 TLS 证书。推荐使用 Let's Encrypt:
-
-```bash
-# 使用 certbot
-sudo certbot certonly --standalone -d your-domain.com
-```
-
-或者使用自签证书（客户端需设置 `insecure: true`）。
-
-### 出口网口配置（Linux 服务端）
-
-当服务器有多个网口时（如原生 IPv4 接口 + WARP IPv6 接口），可以指定 VPN 流量从哪个网口出去：
-
-```yaml
-outbound:
-  ipv4_device: "ens4"   # IPv4 走原生接口
-  ipv6_device: "warp"   # IPv6 走 WARP 接口
-```
-
-**工作原理**：使用策略路由 (policy routing)，创建专用路由表并用 `ip rule` 指定 VPN 流量使用该表。
-
-**智能检测**：留空或设为 `"auto"` 时，自动检测并使用当前系统的默认出口：
-
-```yaml
-outbound:
-  ipv4_device: ""       # 自动检测
-  ipv6_device: "auto"   # 自动检测
-```
-
-**验证规则**：
-```bash
-# 查看策略路由规则
-ip rule show
-ip -6 rule show
-# 应该看到: from 10.10.0.0/24 lookup 100
-
-# 查看路由表
-ip route show table 100
-ip -6 route show table 101
-```
-
-## 命令行选项
-
-```bash
-# 客户端
-./client -c config.yaml -l debug
-
-# 服务端
-./server -c config.yaml -l debug
-
-# 选项:
-#   -c, --config   配置文件路径 (默认: config.yaml)
-#   -l, --log-level 日志级别: debug, info, warn, error (默认: info)
+curl ip.sb      # 检查 IPv4
+curl -6 ip.sb   # 检查 IPv6
 ```
 
 ## 平台支持
@@ -280,70 +148,109 @@ ip -6 route show table 101
 |------|--------|--------|------|
 | Linux x86_64 | ✅ | ✅ | 完整支持 |
 | Linux ARM64 | ✅ | ✅ | 完整支持 |
-| macOS x86_64 | ✅ | ✅ | 完整支持 |
-| macOS ARM64 | ✅ | ✅ | 完整支持 (Apple Silicon) |
-| Windows x64 | ⚠️ | ⚠️ | 需要 wintun.dll |
+| macOS x86_64 | ✅ | ❌ | 客户端完整支持 |
+| macOS ARM64 | ✅ | ❌ | 客户端完整支持 (Apple Silicon) |
+| Windows x64 | ✅ | ❌ | 客户端完整支持 (内嵌 Wintun) |
+| Windows ARM64 | ✅ | ❌ | 客户端完整支持 |
 
-## 故障排除
+## Windows 客户端说明
 
-### 连接不上服务器
+Windows 客户端已**内嵌 Wintun 驱动**，无需额外安装：
+- 首次运行时自动解压 `wintun.dll` 到程序目录
+- 支持 IPv4/IPv6 双栈
+- 自动配置路由和 DNS
 
-1. 检查防火墙是否开放了 Hysteria 端口 (如 8443)
-2. 确认 TLS 证书有效
-3. 确认认证密码和混淆密码正确
+**要求:**
+- Windows 10/11
+- 以管理员身份运行
 
-### 握手失败
+## 配置详解
 
-1. 检查客户端和服务端的 WireGuard 公钥/私钥是否匹配
-2. 确认 `allowed_ips` 配置正确
-
-### IPv6 不工作
-
-1. 确认服务端配置了 IPv6 地址 (`fd00::1/64`)
-2. 确认服务端 peer 的 `allowed_ips` 包含客户端 IPv6 地址
-3. 确认服务端开启了 IPv6 NAT
-
-### DNS 泄漏
-
-确认配置了 DNS 服务器:
+### 带宽配置 (可选)
 
 ```yaml
-tun:
-  dns:
-    servers:
-      - "8.8.8.8"
+hysteria:
+  bandwidth:
+    up: "50 mbps"
+    down: "200 mbps"
 ```
 
-### 在服务器上运行客户端导致 SSH 断开
+不配置时自动探测。支持单位: `bps`, `kbps`, `mbps`, `gbps`
 
-### 在服务器上运行客户端导致 SSH 断开
+### 出口网口配置 (Linux 服务端)
 
-如果你在 Linux VPS 上运行客户端进行测试，VPN 会接管所有流量导致 SSH 断开。
+当服务器有多个网口时，可指定 VPN 流量出口：
 
-**解决方案 (Linux Only)**: 使用策略路由让服务器公网 IP 的流量走原路由：
+```yaml
+outbound:
+  ipv4_device: "ens4"   # IPv4 走原生接口
+  ipv6_device: "warp"   # IPv6 走 WARP 接口
+```
+
+留空或设为 `"auto"` 自动检测。
+
+### PostUp/PostDown 钩子
 
 ```yaml
 tun:
   post_up:
-    - "ip -4 rule add from 你的服务器公网IP lookup main priority 100"
+    - "echo 'VPN connected'"
   post_down:
-    - "ip -4 rule delete from 你的服务器公网IP lookup main priority 100"
+    - "echo 'VPN disconnected'"
 ```
 
-**原理**: HysterGuard 使用 FwMark 策略路由，主路由表 (`main`) 保持清洁。此规则让来自服务器 IP 的流量优先查询主表（直接走物理网关），从而绕过 VPN。
-
-**调试**: 使用 `-l debug` 检查 PostUp 是否执行：
+## 命令行选项
 
 ```bash
-sudo ./client-linux-amd64 -c client.yaml -l debug
-# 查看输出中是否有 "Executing hooks type=PostUp"
+./hysterguard-client -c config.yaml -l debug
+
+# 选项:
+#   -c, --config     配置文件路径 (默认: config.yaml)
+#   -l, --log-level  日志级别: debug, info, warn, error (默认: info)
 ```
 
-**验证规则是否生效**:
+## 从源码构建
 
 ```bash
-ip rule show
-# 应该能看到: from 你的IP lookup main
+git clone https://github.com/hysterguard/hysterguard.git
+cd hysterguard
+
+# 下载 Wintun DLL (Windows 构建需要)
+./scripts/download_wintun.sh
+
+# 编译所有平台
+./scripts/build.sh all
+
+# 或只编译当前平台
+go build -o client ./cmd/client
+go build -o server ./cmd/server
+```
+
+## 故障排除
+
+### 连接不上服务器
+- 检查防火墙是否开放了 Hysteria 端口
+- 确认 TLS 证书有效
+- 确认认证密码正确
+
+### WireGuard 握手失败
+- 检查公钥/私钥配对
+- 确认 `allowed_ips` 配置正确
+
+### Windows 无法上网
+- 确保以管理员身份运行
+- 检查日志中是否有路由配置错误
+- 尝试手动添加路由测试
+
+### Linux SSH 断开
+使用策略路由保持 SSH 连接：
+
+```yaml
+tun:
+  post_up:
+    - "ip -4 rule add from <服务器IP> lookup main priority 100"
+  post_down:
+    - "ip -4 rule delete from <服务器IP> lookup main priority 100"
 ```
 
 ## License
