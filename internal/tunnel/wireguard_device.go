@@ -289,6 +289,12 @@ func (d *WireGuardDevice) configureTUNAddress() error {
 		}
 		d.logger.Debug("Configuring Windows TUN device", "name", name)
 
+		// 先确保接口已启用
+		d.logger.Debug("Enabling network interface", "name", name)
+		if err := runCommand("netsh", "interface", "set", "interface", name, "admin=enabled"); err != nil {
+			d.logger.Warn("Failed to enable interface (may already be enabled)", "error", err)
+		}
+
 		// 配置 IPv4 地址
 		ipv4 := d.config.TUN.Address.IPv4
 		if ipv4 != "" {
@@ -299,10 +305,11 @@ func (d *WireGuardDevice) configureTUNAddress() error {
 			}
 			mask := net.IP(ipnet.Mask).String()
 
-			// netsh interface ip set address "接口名" static IP地址 子网掩码 网关
-			// 对于 TUN 设备，不设置网关
+			d.logger.Debug("Setting IPv4 address", "ip", ip.String(), "mask", mask)
+			// netsh interface ip set address "接口名" static IP地址 子网掩码
 			if err := runCommand("netsh", "interface", "ip", "set", "address",
-				name, "static", ip.String(), mask); err != nil {
+				fmt.Sprintf("name=%s", name), "source=static", fmt.Sprintf("addr=%s", ip.String()), fmt.Sprintf("mask=%s", mask)); err != nil {
+				d.logger.Error("Failed to configure IPv4", "error", err)
 				return fmt.Errorf("failed to configure IPv4: %w", err)
 			}
 			d.logger.Info("IPv4 address configured", "device", name, "ip", ipv4)
@@ -317,9 +324,10 @@ func (d *WireGuardDevice) configureTUNAddress() error {
 				d.logger.Warn("Failed to parse IPv6 address", "error", err)
 			} else {
 				prefixLen, _ := ipnet.Mask.Size()
+				d.logger.Debug("Setting IPv6 address", "ip", ip.String(), "prefix", prefixLen)
 				// netsh interface ipv6 add address "接口名" IP/前缀
 				if err := runCommand("netsh", "interface", "ipv6", "add", "address",
-					name, fmt.Sprintf("%s/%d", ip.String(), prefixLen)); err != nil {
+					fmt.Sprintf("interface=%s", name), fmt.Sprintf("address=%s/%d", ip.String(), prefixLen)); err != nil {
 					d.logger.Warn("Failed to configure IPv6 address", "error", err)
 				} else {
 					d.logger.Info("IPv6 address configured", "device", name, "ip", ipv6)
