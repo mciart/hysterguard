@@ -27,6 +27,7 @@ type HysteriaUDPRelay struct {
 	udpConn  client.HyUDPConn
 
 	mu        sync.RWMutex
+	remoteIP  string // 实际连接的服务器 IP（用于动态路由更新）
 	closed    atomic.Bool
 	unhealthy atomic.Bool  // 标记连接是否不健康
 	errCount  atomic.Int32 // 连续错误计数
@@ -40,6 +41,14 @@ func NewHysteriaUDPRelay(cfg *config.ClientConfig, logger *slog.Logger) (*Hyster
 		config: cfg,
 		logger: logger,
 	}, nil
+}
+
+// GetRemoteIP 获取实际连接的服务器 IP 地址
+// 用于 CDN/DDNS 场景下动态更新路由
+func (r *HysteriaUDPRelay) GetRemoteIP() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.remoteIP
 }
 
 // Connect 连接到 Hysteria 服务器
@@ -125,6 +134,13 @@ func (r *HysteriaUDPRelay) Connect(ctx context.Context) error {
 
 	r.hyClient = hyClient
 	r.udpConn = udpConn
+
+	// 保存实际的服务器 IP（用于动态路由更新）
+	r.mu.Lock()
+	r.remoteIP = serverAddr.IP.String()
+	r.mu.Unlock()
+
+	r.logger.Debug("Connected to server", "remoteIP", r.remoteIP)
 
 	return nil
 }

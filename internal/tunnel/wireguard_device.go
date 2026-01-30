@@ -368,10 +368,10 @@ func decodeWireGuardKey(s string) ([]byte, error) {
 
 // HysteriaBind 实现 WireGuard Bind 接口，使用 Hysteria 传输
 type HysteriaBind struct {
+	mu        sync.RWMutex // 保护 transport 的并发访问
 	transport UDPTransport
 	logger    *slog.Logger
 
-	mu      sync.Mutex
 	closed  atomic.Bool
 	recvBuf []byte
 }
@@ -383,6 +383,22 @@ func NewHysteriaBind(transport UDPTransport, logger *slog.Logger) *HysteriaBind 
 		logger:    logger,
 		recvBuf:   make([]byte, 65535),
 	}
+}
+
+// UpdateTransport 线程安全地更新传输层
+// 用于客户端重连时更新 Hysteria 连接
+func (b *HysteriaBind) UpdateTransport(newTransport UDPTransport) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.transport = newTransport
+	b.logger.Debug("Transport updated")
+}
+
+// getTransport 线程安全地获取传输层
+func (b *HysteriaBind) getTransport() UDPTransport {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.transport
 }
 
 // Open 实现 Bind.Open
@@ -398,8 +414,14 @@ func (b *HysteriaBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			return 0, net.ErrClosed
 		}
 
+		// 线程安全地获取传输层
+		transport := b.getTransport()
+		if transport == nil {
+			return 0, net.ErrClosed
+		}
+
 		// 从 Hysteria 传输层读取数据
-		size, addr, err := b.transport.ReadFrom(packets[0])
+		size, addr, err := transport.ReadFrom(packets[0])
 		if err != nil {
 			return 0, err
 		}
@@ -445,13 +467,19 @@ func (b *HysteriaBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return fmt.Errorf("unexpected endpoint type: %T", ep)
 	}
 
+	// 线程安全地获取传输层
+	transport := b.getTransport()
+	if transport == nil {
+		return net.ErrClosed
+	}
+
 	b.logger.Debug("HysteriaBind.Send",
 		"endpoint", hyEp.addr.String(),
 		"packets", len(bufs),
 	)
 
 	for i, buf := range bufs {
-		n, err := b.transport.WriteTo(buf, hyEp.addr)
+		n, err := transport.WriteTo(buf, hyEp.addr)
 		if err != nil {
 			b.logger.Error("HysteriaBind.Send failed",
 				"packet", i,

@@ -37,13 +37,6 @@ func ExtractDLL() (string, error) {
 }
 
 func doExtract() (string, error) {
-	// 获取可执行文件所在目录
-	exePath, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("failed to get executable path: %w", err)
-	}
-	exeDir := filepath.Dir(exePath)
-
 	// 选择正确架构的 DLL
 	var dllData []byte
 	switch runtime.GOARCH {
@@ -59,24 +52,57 @@ func doExtract() (string, error) {
 		return "", fmt.Errorf("wintun.dll not embedded for architecture: %s", runtime.GOARCH)
 	}
 
-	dllPath := filepath.Join(exeDir, "wintun.dll")
+	// 尝试按优先级选择 DLL 释放目录
+	// 1. 可执行文件目录（如果可写）
+	// 2. %LOCALAPPDATA%\hysterguard\
+	// 3. %TEMP%\hysterguard\
 
-	// 检查是否需要更新（比较文件大小）
-	needUpdate := true
-	if info, err := os.Stat(dllPath); err == nil {
-		if info.Size() == int64(len(dllData)) {
-			needUpdate = false
-		}
+	candidateDirs := []string{}
+
+	// 优先尝试可执行文件目录
+	if exePath, err := os.Executable(); err == nil {
+		candidateDirs = append(candidateDirs, filepath.Dir(exePath))
 	}
 
-	if needUpdate {
-		// 写入 DLL 文件
-		if err := os.WriteFile(dllPath, dllData, 0644); err != nil {
-			return "", fmt.Errorf("failed to write wintun.dll: %w", err)
-		}
+	// 备选：LocalAppData
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		candidateDirs = append(candidateDirs, filepath.Join(localAppData, "hysterguard"))
 	}
 
-	return exeDir, nil
+	// 备选：临时目录
+	candidateDirs = append(candidateDirs, filepath.Join(os.TempDir(), "hysterguard"))
+
+	var lastErr error
+	for _, dir := range candidateDirs {
+		dllPath := filepath.Join(dir, "wintun.dll")
+
+		// 确保目录存在
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			lastErr = fmt.Errorf("failed to create directory %s: %w", dir, err)
+			continue
+		}
+
+		// 检查是否需要更新（比较文件大小）
+		needUpdate := true
+		if info, err := os.Stat(dllPath); err == nil {
+			if info.Size() == int64(len(dllData)) {
+				// DLL 已存在且大小一致，直接返回
+				return dir, nil
+			}
+		}
+
+		if needUpdate {
+			// 尝试写入 DLL 文件
+			if err := os.WriteFile(dllPath, dllData, 0644); err != nil {
+				lastErr = fmt.Errorf("failed to write wintun.dll to %s: %w", dir, err)
+				continue
+			}
+		}
+
+		return dir, nil
+	}
+
+	return "", fmt.Errorf("unable to extract wintun.dll to any directory: %w", lastErr)
 }
 
 // SetDLLDirectory 设置 DLL 搜索目录

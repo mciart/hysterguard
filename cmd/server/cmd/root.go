@@ -329,8 +329,11 @@ type wireGuardConn struct {
 	closed     atomic.Bool // 使用 atomic 代替 mutex 提高性能
 }
 
+// wgPacket WireGuard 响应包
+// 使用缓冲池减少 GC 压力
 type wgPacket struct {
-	data []byte
+	data []byte  // 实际数据切片
+	buf  *[]byte // 缓冲池中的原始缓冲区指针（用于归还）
 }
 
 // ReadFrom 读取 WireGuard 响应
@@ -345,6 +348,10 @@ func (c *wireGuardConn) ReadFrom(b []byte) (int, string, error) {
 	}
 
 	n := copy(b, pkt.data)
+	// 归还缓冲区到池中
+	if pkt.buf != nil {
+		tunnel.PutBuffer(pkt.buf)
+	}
 	return n, c.targetAddr, nil
 }
 
@@ -380,21 +387,23 @@ func (c *wireGuardConn) deliverPacket(data []byte) {
 		return
 	}
 
-	dataCopy := make([]byte, len(data))
+	// 从缓冲池获取缓冲区，减少 GC 压力
+	buf := tunnel.GetBuffer()
+	dataCopy := (*buf)[:len(data)]
 	copy(dataCopy, data)
 
 	// 阻塞式发送，不丢包！
 	// 如果 channel 满了，等待消费者读取
 	// 这对于 BBR/Brutal 拥塞控制至关重要
 	select {
-	case c.recvChan <- &wgPacket{data: dataCopy}:
+	case c.recvChan <- &wgPacket{data: dataCopy, buf: buf}:
 	default:
 		// Channel 满了，尝试阻塞发送（带超时保护）
 		select {
-		case c.recvChan <- &wgPacket{data: dataCopy}:
+		case c.recvChan <- &wgPacket{data: dataCopy, buf: buf}:
 		case <-time.After(100 * time.Millisecond):
-			// 超时才丢包，给日志一个警告
-			// 正常情况下不应该触发
+			// 超时才丢包，归还缓冲区
+			tunnel.PutBuffer(buf)
 		}
 	}
 }

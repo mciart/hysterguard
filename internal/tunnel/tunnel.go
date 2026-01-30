@@ -205,8 +205,15 @@ func (t *ClientTunnel) connect() error {
 		}
 	}
 
+	// 使用实际连接的服务器 IP 初始化 RouteManager
+	// 这对于 CDN/DDNS 场景很重要，确保路由表中的 IP 是实际连接的 IP
+	actualServerIP := hyRelay.GetRemoteIP()
+	if actualServerIP == "" {
+		actualServerIP = t.config.Hysteria.Server // 回退到配置的服务器地址
+	}
+
 	t.mu.Lock()
-	t.routeManager = NewRouteManager(t.config.Hysteria.Server, tunGateway, tunDeviceName, t.logger)
+	t.routeManager = NewRouteManager(actualServerIP, tunGateway, tunDeviceName, t.logger)
 	t.mu.Unlock()
 
 	if err := t.routeManager.Setup(); err != nil {
@@ -281,11 +288,24 @@ func (t *ClientTunnel) connectionMonitor() {
 
 					t.mu.Lock()
 					t.hysteriaRelay = hyRelay
-					// 更新 WireGuard 的传输层
+					// 使用线程安全的方法更新 WireGuard 的传输层
 					if t.wgDevice != nil && t.wgDevice.bind != nil {
-						t.wgDevice.bind.transport = hyRelay
+						t.wgDevice.bind.UpdateTransport(hyRelay)
 					}
+					routeManager := t.routeManager
 					t.mu.Unlock()
+
+					// 动态更新路由表，处理 CDN/DDNS IP 变化
+					if routeManager != nil {
+						newIP := hyRelay.GetRemoteIP()
+						if newIP != "" {
+							if err := routeManager.UpdateServerIP(newIP); err != nil {
+								t.logger.Warn("Failed to update server route", "error", err)
+							} else {
+								t.logger.Info("Server route updated for new IP", "ip", newIP)
+							}
+						}
+					}
 
 					t.logger.Info("Reconnected successfully!")
 					t.setStatus(StatusConnected)

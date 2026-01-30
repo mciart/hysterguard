@@ -26,9 +26,11 @@ type HysteriaServerBind struct {
 }
 
 // serverPacket 服务端数据包
+// 使用缓冲池来减少 GC 压力
 type serverPacket struct {
-	data     []byte
-	endpoint string // 客户端地址标识
+	data     []byte  // 实际数据切片（长度为实际数据大小）
+	buf      *[]byte // 缓冲池中的原始缓冲区指针（用于归还）
+	endpoint string  // 客户端地址标识
 }
 
 // ServerEndpoint 服务端端点实现
@@ -64,8 +66,9 @@ func (b *HysteriaServerBind) DeliverPacket(data []byte, clientAddr string) {
 		return
 	}
 
-	// 复制数据以避免数据竞争
-	dataCopy := make([]byte, len(data))
+	// 从缓冲池获取缓冲区，减少 GC 压力
+	buf := GetBuffer()
+	dataCopy := (*buf)[:len(data)]
 	copy(dataCopy, data)
 
 	b.mu.RLock()
@@ -73,6 +76,7 @@ func (b *HysteriaServerBind) DeliverPacket(data []byte, clientAddr string) {
 	b.mu.RUnlock()
 
 	if ch == nil {
+		PutBuffer(buf) // 归还缓冲区
 		return
 	}
 
@@ -80,11 +84,12 @@ func (b *HysteriaServerBind) DeliverPacket(data []byte, clientAddr string) {
 	select {
 	case ch <- &serverPacket{
 		data:     dataCopy,
+		buf:      buf,
 		endpoint: clientAddr,
 	}:
 	default:
-		// 队列满或已关闭，丢弃包
-		// TODO: 可以添加日志或者 metrics
+		// 队列满或已关闭，丢弃包并归还缓冲区
+		PutBuffer(buf)
 	}
 }
 
@@ -113,6 +118,10 @@ func (b *HysteriaServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, erro
 		n = copy(packets[0], pkt.data)
 		sizes[0] = n
 		eps[0] = &ServerEndpoint{addr: pkt.endpoint}
+		// 归还缓冲区
+		if pkt.buf != nil {
+			PutBuffer(pkt.buf)
+		}
 		count := 1
 
 		// 2. 尝试非阻塞读取更多包 (Batch Processing)
@@ -125,6 +134,10 @@ func (b *HysteriaServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, erro
 				n = copy(packets[count], pkt.data)
 				sizes[count] = n
 				eps[count] = &ServerEndpoint{addr: pkt.endpoint}
+				// 归还缓冲区
+				if pkt.buf != nil {
+					PutBuffer(pkt.buf)
+				}
 				count++
 			default:
 				// 通道空了，直接返回已读取的包

@@ -167,8 +167,50 @@ func (d *DNSManager) getDNS(service string) ([]string, error) {
 	return servers, nil
 }
 
-// setupLinux Linux DNS 配置 (使用 resolv.conf)
+// hasResolvectl 检测系统是否支持 resolvectl
+func (d *DNSManager) hasResolvectl() bool {
+	_, err := exec.LookPath("resolvectl")
+	return err == nil
+}
+
+// setupLinux Linux DNS 配置
+// 优先使用 resolvectl (systemd-resolved)，回退到 resolv.conf
 func (d *DNSManager) setupLinux() error {
+	// 检测是否支持 resolvectl
+	if d.hasResolvectl() {
+		d.logger.Debug("Using resolvectl for DNS configuration")
+		return d.setupLinuxResolvectl()
+	}
+
+	d.logger.Debug("Using resolv.conf for DNS configuration")
+	return d.setupLinuxResolvconf()
+}
+
+// setupLinuxResolvectl 使用 resolvectl 配置 DNS
+func (d *DNSManager) setupLinuxResolvectl() error {
+	// 获取默认网络接口
+	ifName := "hysterguard0" // 默认使用 TUN 接口名
+
+	// 设置 DNS
+	for _, server := range d.dnsServers {
+		if err := d.runCmd("resolvectl", "dns", ifName, server); err != nil {
+			d.logger.Warn("Failed to set DNS via resolvectl", "server", server, "error", err)
+		}
+	}
+
+	// 设置为默认 DNS 路由（将所有 DNS 查询路由到此接口）
+	if err := d.runCmd("resolvectl", "default-route", ifName, "yes"); err != nil {
+		d.logger.Warn("Failed to set default DNS route", "error", err)
+	}
+
+	d.originalDNS["method"] = []string{"resolvectl"}
+	d.configured = true
+	d.logger.Info("DNS configured successfully via resolvectl")
+	return nil
+}
+
+// setupLinuxResolvconf 使用 resolv.conf 配置 DNS（回退方案）
+func (d *DNSManager) setupLinuxResolvconf() error {
 	// 备份原始 resolv.conf
 	original, err := os.ReadFile("/etc/resolv.conf")
 	if err != nil {
@@ -189,22 +231,35 @@ func (d *DNSManager) setupLinux() error {
 		return fmt.Errorf("failed to write resolv.conf: %w", err)
 	}
 
+	d.originalDNS["method"] = []string{"resolvconf"}
 	d.configured = true
-	d.logger.Info("DNS configured successfully")
+	d.logger.Info("DNS configured successfully via resolv.conf")
 	return nil
 }
 
 // teardownLinux Linux DNS 恢复
 func (d *DNSManager) teardownLinux() error {
-	if original, ok := d.originalDNS["resolv.conf"]; ok && len(original) > 0 {
-		if err := os.WriteFile("/etc/resolv.conf", []byte(original[0]), 0644); err != nil {
-			d.logger.Warn("Failed to restore resolv.conf", "error", err)
+	method := "resolvconf"
+	if methods, ok := d.originalDNS["method"]; ok && len(methods) > 0 {
+		method = methods[0]
+	}
+
+	if method == "resolvectl" {
+		// 使用 resolvectl 恢复：重置 DNS 设置
+		d.runCmd("resolvectl", "revert", "hysterguard0")
+		d.logger.Info("DNS settings restored via resolvectl")
+	} else {
+		// 恢复 resolv.conf
+		if original, ok := d.originalDNS["resolv.conf"]; ok && len(original) > 0 {
+			if err := os.WriteFile("/etc/resolv.conf", []byte(original[0]), 0644); err != nil {
+				d.logger.Warn("Failed to restore resolv.conf", "error", err)
+			}
 		}
+		d.logger.Info("DNS settings restored via resolv.conf")
 	}
 
 	d.configured = false
 	d.originalDNS = make(map[string][]string)
-	d.logger.Info("DNS settings restored")
 	return nil
 }
 

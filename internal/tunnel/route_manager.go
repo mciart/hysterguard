@@ -8,17 +8,20 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // RouteManager 路由管理器
 type RouteManager struct {
-	logger      *slog.Logger
-	serverIP    string
-	gateway     string
-	tunGateway  string
-	tunDevice   string // 实际的 TUN 设备名称
-	routesAdded []string
-	configured  bool
+	mu           sync.RWMutex
+	logger       *slog.Logger
+	serverIP     string
+	gateway      string
+	tunGateway   string
+	tunDevice    string   // 实际的 TUN 设备名称
+	routesAdded  []string // 非服务器路由（如 VPN 默认路由标记）
+	serverRoutes []string // 服务器 IP 直连路由（动态管理）
+	configured   bool
 }
 
 // NewRouteManager 创建路由管理器
@@ -30,11 +33,79 @@ func NewRouteManager(serverAddr string, tunGateway string, tunDevice string, log
 	}
 
 	return &RouteManager{
-		logger:     logger,
-		serverIP:   host,
-		tunGateway: tunGateway,
-		tunDevice:  tunDevice,
+		logger:       logger,
+		serverIP:     host,
+		tunGateway:   tunGateway,
+		tunDevice:    tunDevice,
+		serverRoutes: make([]string, 0),
 	}
+}
+
+// UpdateServerIP 更新服务器 IP 并动态调整路由
+// 用于处理 CDN/DDNS 场景下服务器 IP 变化
+func (r *RouteManager) UpdateServerIP(newIP string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if newIP == "" {
+		return fmt.Errorf("new IP cannot be empty")
+	}
+
+	// 检查 IP 是否已在路由表中
+	for _, ip := range r.serverRoutes {
+		if ip == newIP {
+			r.logger.Debug("Server IP already in route table", "ip", newIP)
+			return nil
+		}
+	}
+
+	r.logger.Info("Updating server route for new IP", "oldIP", r.serverIP, "newIP", newIP)
+
+	// 添加新 IP 的直连路由
+	if err := r.addServerRoute(newIP); err != nil {
+		r.logger.Warn("Failed to add route for new server IP", "ip", newIP, "error", err)
+		// 继续执行，不返回错误，因为可能路由已存在
+	}
+
+	r.serverIP = newIP
+	return nil
+}
+
+// addServerRoute 添加服务器 IP 的直连路由（内部方法，调用时需持有锁）
+func (r *RouteManager) addServerRoute(ip string) error {
+	if ip == "" {
+		return nil
+	}
+
+	var err error
+	switch runtime.GOOS {
+	case "darwin":
+		if r.gateway != "" {
+			err = r.runCmd("route", "add", "-host", ip, r.gateway)
+		}
+	case "linux":
+		gateway, _ := r.getDefaultGatewayLinux()
+		if gateway != "" {
+			err = r.runCmd("ip", "route", "add", ip, "via", gateway)
+		}
+	case "windows":
+		if r.gateway != "" {
+			err = r.runCmd("route", "add", ip, "mask", "255.255.255.255", r.gateway, "metric", "1")
+		}
+	}
+
+	if err == nil {
+		r.serverRoutes = append(r.serverRoutes, ip)
+		r.logger.Debug("Added server route", "ip", ip)
+	}
+	return err
+}
+
+// GetServerIP 获取当前配置的服务器 IP
+func (r *RouteManager) GetServerIP() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.serverIP
 }
 
 // Setup 配置路由（将所有流量导向 VPN）
@@ -89,7 +160,7 @@ func (r *RouteManager) setupDarwin() error {
 	if err := r.runCmd("route", "add", "-host", r.serverIP, gateway); err != nil {
 		r.logger.Warn("Failed to add server route (may already exist)", "error", err)
 	} else {
-		r.routesAdded = append(r.routesAdded, r.serverIP)
+		r.serverRoutes = append(r.serverRoutes, r.serverIP)
 	}
 
 	// 3. 删除默认路由
@@ -150,8 +221,8 @@ func (r *RouteManager) cleanupDarwin() error {
 		}
 	}
 
-	// 3. 删除服务器直接路由
-	for _, route := range r.routesAdded {
+	// 3. 删除服务器直接路由（使用 serverRoutes）
+	for _, route := range r.serverRoutes {
 		r.logger.Debug("Removing server route", "route", route)
 		if err := r.runCmd("route", "delete", "-host", route); err != nil {
 			errs = append(errs, err)
@@ -160,6 +231,7 @@ func (r *RouteManager) cleanupDarwin() error {
 
 	r.configured = false
 	r.routesAdded = nil
+	r.serverRoutes = nil
 
 	if len(errs) > 0 {
 		r.logger.Warn("Some routes could not be removed", "errors", errs)
@@ -200,11 +272,12 @@ func (r *RouteManager) setupLinux() error {
 
 	// 添加到服务器的直接路由 (Main 表)
 	// 这是必须的，否则由 Hysteria 发出的 UDP 包会被 FwMark 规则路由进 VPN 隧道，导致死循环
+	r.gateway = gateway // 保存网关以便动态添加路由
 	r.logger.Debug("Adding direct route to server", "server", r.serverIP)
 	if err := r.runCmd("ip", "route", "add", r.serverIP, "via", gateway); err != nil {
 		r.logger.Warn("Failed to add server route (may already exist)", "error", err)
 	} else {
-		r.routesAdded = append(r.routesAdded, r.serverIP)
+		r.serverRoutes = append(r.serverRoutes, r.serverIP)
 	}
 
 	// 2. 添加路由到 table 51820
@@ -247,11 +320,9 @@ func (r *RouteManager) setupLinux() error {
 func (r *RouteManager) cleanupLinux() error {
 	r.logger.Info("Cleaning up VPN routes (FwMark mode)")
 
-	// 1. 清理添加到 Main 表的显式路由 (服务器路由)
-	for _, route := range r.routesAdded {
-		if route != "default-51820" {
-			r.runCmd("ip", "route", "del", route)
-		}
+	// 1. 清理服务器路由
+	for _, route := range r.serverRoutes {
+		r.runCmd("ip", "route", "del", route)
 	}
 
 	// 2. 删除策略路由规则
@@ -267,7 +338,7 @@ func (r *RouteManager) cleanupLinux() error {
 		r.runCmd("ip", "-6", "rule", "del", "lookup", "main", "suppress_prefixlength", "0")
 	}
 
-	// 2. 清空 51820 路由表
+	// 3. 清空 51820 路由表
 	r.runCmd("ip", "route", "flush", "table", "51820")
 	if r.tunDevice != "" {
 		r.runCmd("ip", "-6", "route", "flush", "table", "51820")
@@ -275,6 +346,7 @@ func (r *RouteManager) cleanupLinux() error {
 
 	r.configured = false
 	r.routesAdded = nil
+	r.serverRoutes = nil
 	r.logger.Info("VPN routes removed")
 	return nil
 }
@@ -321,7 +393,7 @@ func (r *RouteManager) setupWindows() error {
 	if err := r.runCmd("route", "add", r.serverIP, "mask", "255.255.255.255", gateway, "metric", "1"); err != nil {
 		r.logger.Warn("Failed to add server route (may already exist)", "error", err)
 	} else {
-		r.routesAdded = append(r.routesAdded, r.serverIP)
+		r.serverRoutes = append(r.serverRoutes, r.serverIP)
 	}
 
 	// 4. 添加 VPN 路由 (0.0.0.0/1 和 128.0.0.0/1 覆盖默认路由)
@@ -401,7 +473,7 @@ func (r *RouteManager) cleanupWindows() error {
 	}
 
 	// 2. 删除服务器直接路由
-	for _, route := range r.routesAdded {
+	for _, route := range r.serverRoutes {
 		r.logger.Debug("Removing server route", "route", route)
 		if err := r.runCmd("route", "delete", route); err != nil {
 			errs = append(errs, err)
@@ -410,6 +482,7 @@ func (r *RouteManager) cleanupWindows() error {
 
 	r.configured = false
 	r.routesAdded = nil
+	r.serverRoutes = nil
 
 	if len(errs) > 0 {
 		r.logger.Warn("Some routes could not be removed", "errors", errs)
