@@ -30,9 +30,6 @@ wireguard:
   # 服务端私钥（使用 wg genkey 生成）
   private_key: "SERVER_PRIVATE_KEY_HERE"
   
-  # 监听端口（仅用于配置，All-in-One 模式不实际监听）
-  listen_port: 51820
-  
   # 客户端配置
   peers:
     - public_key: "CLIENT_PUBLIC_KEY_HERE"
