@@ -153,14 +153,17 @@ func (r *HysteriaUDPRelay) ReadFrom(b []byte) (n int, addr net.Addr, err error) 
 
 	data, addrStr, err := r.udpConn.Receive()
 	if err != nil {
+		r.logger.Warn("ReadFrom: receive error", "error", err)
 		return 0, nil, err
 	}
 
 	n = copy(b, data)
+	r.logger.Info("ReadFrom: received data from server", "dataLen", n, "addrStr", addrStr)
 
 	// 解析地址
 	udpAddr, err := net.ResolveUDPAddr("udp", addrStr)
 	if err != nil {
+		r.logger.Warn("ReadFrom: failed to resolve address", "addrStr", addrStr, "error", err)
 		return n, nil, err
 	}
 

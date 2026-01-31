@@ -1,6 +1,6 @@
 # HysterGuard 服务端配置示例
 
-# 监听地址
+# Hysteria 监听地址
 listen: ":443"
 
 # Hysteria 配置
@@ -27,17 +27,32 @@ hysteria:
 
 # WireGuard 配置
 wireguard:
-  # 服务端私钥（使用 wg genkey 生成）
+  # 运行模式：
+  # - "local": 在本地启动 WireGuard，监听指定地址
+  # - "forward": 不启动 WireGuard，仅转发到指定目标（远程 WireGuard 服务器）
+  mode: "local"
+  
+  # WireGuard 监听地址（仅 local 模式有效）
+  # 使用 127.0.0.1 限制本地访问（通过 Hysteria 代理）
+  # 使用 0.0.0.0 允许其他 VPS 直接连接
+  listen: "127.0.0.1:51820"
+  
+  # Hysteria 代理目标地址
+  # local 模式：应与 listen 一致
+  # forward 模式：远程 WireGuard 服务器地址，如 "192.168.1.100:51820"
+  target: "127.0.0.1:51820"
+  
+  # 服务端私钥（使用 wg genkey 生成，仅 local 模式需要）
   private_key: "SERVER_PRIVATE_KEY_HERE"
   
-  # 客户端配置
+  # 客户端配置（仅 local 模式需要）
   peers:
     - public_key: "CLIENT_PUBLIC_KEY_HERE"
       allowed_ips:
         - "10.0.0.2/32"
         - "fd00::2/128"
 
-  # 服务端 IP 地址
+  # 服务端 IP 地址（仅 local 模式需要）
   address:
     ipv4: "10.0.0.1/24"
     ipv6: "fd00::1/64"
@@ -52,7 +67,7 @@ wireguard:
   #   - "ip -4 rule delete from 服务器公网IP lookup main"
   #   - "iptables -D FORWARD -i wg0 -j ACCEPT"
 
-# 出口网口配置（可选，仅 Linux）
+# 出口网口配置（可选，仅 Linux，仅 local 模式）
 # 指定 VPN 客户端流量从哪个网口出去
 # 留空或 "auto" 则智能检测系统当前的出口网口
 outbound:

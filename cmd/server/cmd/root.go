@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -87,30 +86,34 @@ func runServer(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ============ 1. 启动 WireGuard 服务（All-in-One 模式，无端口监听）============
-	logger.Info("Starting WireGuard server (all-in-one mode)...")
-	wgTunnel, err := tunnel.NewServerTunnel(cfg, logger)
-	if err != nil {
-		return fmt.Errorf("failed to create WireGuard tunnel: %w", err)
+	// ============ 1. 根据模式启动 WireGuard 服务 ============
+	var wgTunnel *tunnel.ServerTunnel
+	var wgTarget string
+
+	if cfg.WireGuard.Mode == "local" {
+		logger.Info("Starting WireGuard server (local mode)...", "listen", cfg.WireGuard.Listen)
+		var err error
+		wgTunnel, err = tunnel.NewServerTunnel(cfg, logger)
+		if err != nil {
+			return fmt.Errorf("failed to create WireGuard tunnel: %w", err)
+		}
+
+		if err := wgTunnel.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start WireGuard tunnel: %w", err)
+		}
+		defer wgTunnel.Stop()
+
+		wgTarget = cfg.WireGuard.Target
+		logger.Info("WireGuard server started", "listen", cfg.WireGuard.Listen, "target", wgTarget)
+	} else {
+		// forward 模式：不启动本地 WireGuard，只转发
+		wgTarget = cfg.WireGuard.Target
+		logger.Info("WireGuard forward mode", "target", wgTarget)
 	}
 
-	if err := wgTunnel.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start WireGuard tunnel: %w", err)
-	}
-	defer wgTunnel.Stop()
-
-	// 获取 WireGuard bind
-	wgBind := wgTunnel.GetBind()
-
-	// ============ 2. 创建 WireGuard Outbound（连接 Hysteria 和 WireGuard）============
-	wgOutbound := NewWireGuardOutbound(wgBind, logger)
-
-	// 设置 WireGuard bind 的发送回调（将 WireGuard 响应发回客户端）
-	wgBind.SetSendCallback(wgOutbound.SendToClient)
-
-	// ============ 3. 启动 Hysteria 服务 ============
+	// ============ 2. 启动 Hysteria 服务（使用默认 Outbound）============
 	logger.Info("Starting Hysteria server...")
-	hyServer, err := createHysteriaServer(cfg, wgOutbound, logger)
+	hyServer, err := createHysteriaServer(cfg, wgTarget, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create Hysteria server: %w", err)
 	}
@@ -123,10 +126,18 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// 打印启动信息
 	logger.Info("===============================================")
-	logger.Info("HysterGuard Server is now running (All-in-One)")
-	logger.Info("  Hysteria (obfuscation): " + cfg.Listen)
-	logger.Info("  WireGuard: embedded (no port listening)")
+	if cfg.WireGuard.Mode == "local" {
+		logger.Info("HysterGuard Server is now running (Local Mode)")
+		logger.Info("  Hysteria (obfuscation): " + cfg.Listen)
+		logger.Info("  WireGuard listen: " + cfg.WireGuard.Listen)
+		logger.Info("  WireGuard target: " + wgTarget)
+	} else {
+		logger.Info("HysterGuard Server is now running (Forward Mode)")
+		logger.Info("  Hysteria (obfuscation): " + cfg.Listen)
+		logger.Info("  WireGuard target: " + wgTarget)
+	}
 	logger.Info("===============================================")
 	logger.Info("Press Ctrl+C to stop")
 
@@ -134,7 +145,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// 非阻塞发送，队列满时丢包
 	select {
 	case sig := <-sigCh:
 		logger.Info("Received signal, shutting down", "signal", sig)
@@ -156,7 +166,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 }
 
 // createHysteriaServer 创建 Hysteria 服务端
-func createHysteriaServer(cfg *config.ServerConfig, outbound server.Outbound, logger *slog.Logger) (server.Server, error) {
+func createHysteriaServer(cfg *config.ServerConfig, wgTarget string, logger *slog.Logger) (server.Server, error) {
 	// 加载 TLS 证书
 	cert, err := tls.LoadX509KeyPair(cfg.Hysteria.TLS.Cert, cfg.Hysteria.TLS.Key)
 	if err != nil {
@@ -202,7 +212,7 @@ func createHysteriaServer(cfg *config.ServerConfig, outbound server.Outbound, lo
 			Certificates: []tls.Certificate{cert},
 		},
 		Conn:                  packetConn,
-		Outbound:              outbound,
+		Outbound:              &defaultOutbound{wgTarget: wgTarget, logger: logger},
 		IgnoreClientBandwidth: false, // 允许客户端指定带宽（启用 Brutal）
 		Authenticator: &simpleAuthenticator{
 			password: cfg.Hysteria.Auth,
@@ -212,6 +222,120 @@ func createHysteriaServer(cfg *config.ServerConfig, outbound server.Outbound, lo
 	}
 
 	return server.NewServer(serverConfig)
+}
+
+// defaultOutbound 默认 Outbound 实现，使用标准 UDP 代理
+type defaultOutbound struct {
+	wgTarget string
+	logger   *slog.Logger
+}
+
+// TCP 实现 TCP 连接
+func (o *defaultOutbound) TCP(reqAddr string) (net.Conn, error) {
+	return net.Dial("tcp", reqAddr)
+}
+
+// UDP 实现 UDP 连接
+func (o *defaultOutbound) UDP(reqAddr string) (server.UDPConn, error) {
+	// 使用配置的 WireGuard 目标地址
+	target := reqAddr
+	if reqAddr == "127.0.0.1:51820" || reqAddr == o.wgTarget {
+		target = o.wgTarget
+	}
+
+	o.logger.Debug("Creating UDP connection", "reqAddr", reqAddr, "target", target)
+
+	// 创建真实的 UDP 连接
+	udpAddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve UDP address: %w", err)
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial UDP: %w", err)
+	}
+
+	// 设置缓冲区
+	_ = conn.SetReadBuffer(4194304)
+	_ = conn.SetWriteBuffer(4194304)
+
+	c := &realUDPConn{
+		conn:     conn,
+		target:   target,
+		recvChan: make(chan []byte, 1024),
+		logger:   o.logger,
+	}
+
+	// 启动异步读取 goroutine
+	go c.readLoop()
+
+	return c, nil
+}
+
+// realUDPConn 真实 UDP 连接包装器（异步读取）
+type realUDPConn struct {
+	conn     *net.UDPConn
+	target   string
+	recvChan chan []byte
+	closed   atomic.Bool
+	logger   *slog.Logger
+}
+
+// readLoop 异步读取循环
+func (c *realUDPConn) readLoop() {
+	buf := make([]byte, 2000)
+	for !c.closed.Load() {
+		n, err := c.conn.Read(buf)
+		if err != nil {
+			if !c.closed.Load() {
+				c.logger.Debug("UDP read error", "error", err)
+			}
+			return
+		}
+
+		// 复制数据
+		dataCopy := make([]byte, n)
+		copy(dataCopy, buf[:n])
+
+		select {
+		case c.recvChan <- dataCopy:
+			// 成功入队
+		default:
+			c.logger.Warn("UDP recv channel full, dropping packet")
+		}
+	}
+}
+
+func (c *realUDPConn) ReadFrom(b []byte) (int, string, error) {
+	if c.closed.Load() {
+		return 0, "", net.ErrClosed
+	}
+
+	// 使用短超时让 Hysteria 能继续处理其他数据
+	select {
+	case data := <-c.recvChan:
+		n := copy(b, data)
+		return n, c.target, nil
+	case <-time.After(5 * time.Millisecond):
+		// 返回空数据，让 Hysteria 继续处理其他方向的数据
+		return 0, "", nil
+	}
+}
+
+func (c *realUDPConn) WriteTo(b []byte, addr string) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return c.conn.Write(b)
+}
+
+func (c *realUDPConn) Close() error {
+	if c.closed.Swap(true) {
+		return nil
+	}
+	close(c.recvChan)
+	return c.conn.Close()
 }
 
 // simpleAuthenticator 简单密码认证器
@@ -260,150 +384,4 @@ func (l *serverEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint3
 
 func (l *serverEventLogger) UDPError(addr net.Addr, id string, sessionID uint32, err error) {
 	l.logger.Warn("UDP error", "addr", addr.String(), "id", id, "sessionID", sessionID, "error", err)
-}
-
-// WireGuardOutbound 实现 Hysteria server.Outbound 接口
-type WireGuardOutbound struct {
-	bind   *tunnel.HysteriaServerBind
-	logger *slog.Logger
-
-	mu    sync.RWMutex
-	conns map[string]*wireGuardConn
-}
-
-// NewWireGuardOutbound 创建 WireGuard Outbound
-func NewWireGuardOutbound(bind *tunnel.HysteriaServerBind, logger *slog.Logger) *WireGuardOutbound {
-	return &WireGuardOutbound{
-		bind:   bind,
-		logger: logger,
-		conns:  make(map[string]*wireGuardConn),
-	}
-}
-
-// TCP 实现 TCP 连接（直接连接外部网络）
-func (o *WireGuardOutbound) TCP(reqAddr string) (net.Conn, error) {
-	// 支持普通 TCP 连接
-	return net.Dial("tcp", reqAddr)
-}
-
-// UDP 实现 UDP 连接
-func (o *WireGuardOutbound) UDP(reqAddr string) (server.UDPConn, error) {
-	o.logger.Debug("Creating WireGuard UDP connection", "target", reqAddr)
-
-	conn := &wireGuardConn{
-		bind:       o.bind,
-		targetAddr: reqAddr,
-		recvChan:   make(chan *wgPacket, 16384), // 增大缓冲区，防止丢包
-		outbound:   o,
-	}
-
-	// 保存连接以便发送响应
-	o.mu.Lock()
-	o.conns[reqAddr] = conn
-	o.mu.Unlock()
-
-	return conn, nil
-}
-
-// SendToClient WireGuard bind 的回调，将响应发送回客户端
-func (o *WireGuardOutbound) SendToClient(data []byte, endpoint string) error {
-	o.mu.RLock()
-	conn, ok := o.conns[endpoint]
-	o.mu.RUnlock()
-
-	if !ok {
-		// 可能连接已关闭
-		return nil
-	}
-
-	conn.deliverPacket(data)
-	return nil
-}
-
-// wireGuardConn 实现 server.UDPConn 接口
-type wireGuardConn struct {
-	bind       *tunnel.HysteriaServerBind
-	targetAddr string
-	recvChan   chan *wgPacket
-	outbound   *WireGuardOutbound
-	closed     atomic.Bool // 使用 atomic 代替 mutex 提高性能
-}
-
-// wgPacket WireGuard 响应包
-// 使用缓冲池减少 GC 压力
-type wgPacket struct {
-	data []byte  // 实际数据切片
-	buf  *[]byte // 缓冲池中的原始缓冲区指针（用于归还）
-}
-
-// ReadFrom 读取 WireGuard 响应
-func (c *wireGuardConn) ReadFrom(b []byte) (int, string, error) {
-	if c.closed.Load() {
-		return 0, "", net.ErrClosed
-	}
-
-	pkt, ok := <-c.recvChan
-	if !ok {
-		return 0, "", net.ErrClosed
-	}
-
-	n := copy(b, pkt.data)
-	// 归还缓冲区到池中
-	if pkt.buf != nil {
-		tunnel.PutBuffer(pkt.buf)
-	}
-	return n, c.targetAddr, nil
-}
-
-// WriteTo 写入数据到 WireGuard
-func (c *wireGuardConn) WriteTo(b []byte, addr string) (int, error) {
-	if c.closed.Load() {
-		return 0, net.ErrClosed
-	}
-
-	// 将数据包投递到 WireGuard bind
-	c.bind.DeliverPacket(b, c.targetAddr)
-	return len(b), nil
-}
-
-// Close 关闭连接
-func (c *wireGuardConn) Close() error {
-	if c.closed.Swap(true) {
-		return nil // 已经关闭过
-	}
-
-	// 从 outbound 移除
-	c.outbound.mu.Lock()
-	delete(c.outbound.conns, c.targetAddr)
-	c.outbound.mu.Unlock()
-
-	close(c.recvChan)
-	return nil
-}
-
-// deliverPacket 投递 WireGuard 响应包
-func (c *wireGuardConn) deliverPacket(data []byte) {
-	if c.closed.Load() {
-		return
-	}
-
-	// 从缓冲池获取缓冲区，减少 GC 压力
-	buf := tunnel.GetBuffer()
-	dataCopy := (*buf)[:len(data)]
-	copy(dataCopy, data)
-
-	// 阻塞式发送，不丢包！
-	// 如果 channel 满了，等待消费者读取
-	// 这对于 BBR/Brutal 拥塞控制至关重要
-	select {
-	case c.recvChan <- &wgPacket{data: dataCopy, buf: buf}:
-	default:
-		// Channel 满了，尝试阻塞发送（带超时保护）
-		select {
-		case c.recvChan <- &wgPacket{data: dataCopy, buf: buf}:
-		case <-time.After(100 * time.Millisecond):
-			// 超时才丢包，归还缓冲区
-			tunnel.PutBuffer(buf)
-		}
-	}
 }

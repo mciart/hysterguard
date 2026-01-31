@@ -458,7 +458,6 @@ func (b *HysteriaBind) SetMark(mark uint32) error {
 // Send 实现 Bind.Send
 func (b *HysteriaBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	if b.closed.Load() {
-		b.logger.Debug("HysteriaBind.Send: bind is closed")
 		return net.ErrClosed
 	}
 
@@ -467,29 +466,21 @@ func (b *HysteriaBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return fmt.Errorf("unexpected endpoint type: %T", ep)
 	}
 
-	// 线程安全地获取传输层
 	transport := b.getTransport()
 	if transport == nil {
+		b.logger.Warn("HysteriaBind.Send: transport is nil")
 		return net.ErrClosed
 	}
 
-	b.logger.Debug("HysteriaBind.Send",
-		"endpoint", hyEp.addr.String(),
-		"packets", len(bufs),
-	)
+	b.logger.Info("HysteriaBind.Send CALLED", "endpoint", hyEp.addr.String(), "packets", len(bufs))
 
 	for i, buf := range bufs {
 		n, err := transport.WriteTo(buf, hyEp.addr)
 		if err != nil {
-			b.logger.Error("HysteriaBind.Send failed",
-				"packet", i,
-				"size", len(buf),
-				"endpoint", hyEp.addr.String(),
-				"error", err,
-			)
+			b.logger.Error("HysteriaBind.Send failed", "packet", i, "error", err)
 			return err
 		}
-		b.logger.Debug("HysteriaBind.Send success", "packet", i, "bytes", n)
+		b.logger.Info("HysteriaBind.Send success", "packet", i, "bytes", n)
 	}
 
 	return nil

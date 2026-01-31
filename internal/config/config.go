@@ -82,8 +82,11 @@ type WireGuardConfig struct {
 
 // WireGuardServerConfig WireGuard 服务端配置
 type WireGuardServerConfig struct {
-	PrivateKey string        `yaml:"private_key"`
-	ListenPort int           `yaml:"listen_port"`
+	Mode       string        `yaml:"mode"`        // 运行模式: "local" (本地监听) 或 "forward" (转发)
+	Listen     string        `yaml:"listen"`      // 监听地址 (local 模式)，如 "127.0.0.1:51820"
+	Target     string        `yaml:"target"`      // Hysteria 代理目标地址，如 "127.0.0.1:51820"
+	PrivateKey string        `yaml:"private_key"` // 私钥
+	ListenPort int           `yaml:"listen_port"` // 已废弃，使用 Listen
 	Peers      []PeerConfig  `yaml:"peers"`
 	Address    AddressConfig `yaml:"address"`
 	PostUp     []string      `yaml:"post_up"`   // 接口启动后执行的命令
@@ -172,6 +175,19 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	if config.Listen == "" {
 		config.Listen = ":443"
 	}
+	// WireGuard 模式默认为 local
+	if config.WireGuard.Mode == "" {
+		config.WireGuard.Mode = "local"
+	}
+	// 默认监听地址
+	if config.WireGuard.Listen == "" {
+		config.WireGuard.Listen = "127.0.0.1:51820"
+	}
+	// 默认代理目标（与监听地址一致）
+	if config.WireGuard.Target == "" {
+		config.WireGuard.Target = config.WireGuard.Listen
+	}
+	// 兼容旧配置
 	if config.WireGuard.ListenPort == 0 {
 		config.WireGuard.ListenPort = 51820
 	}
@@ -207,8 +223,17 @@ func (c *ServerConfig) Validate() error {
 	if c.Hysteria.TLS.Cert == "" || c.Hysteria.TLS.Key == "" {
 		return fmt.Errorf("hysteria.tls.cert and hysteria.tls.key are required")
 	}
-	if c.WireGuard.PrivateKey == "" {
-		return fmt.Errorf("wireguard.private_key is required")
+	// 验证 WireGuard 模式
+	if c.WireGuard.Mode != "local" && c.WireGuard.Mode != "forward" {
+		return fmt.Errorf("wireguard.mode must be 'local' or 'forward'")
+	}
+	// local 模式需要私钥
+	if c.WireGuard.Mode == "local" && c.WireGuard.PrivateKey == "" {
+		return fmt.Errorf("wireguard.private_key is required for local mode")
+	}
+	// 都需要目标地址
+	if c.WireGuard.Target == "" {
+		return fmt.Errorf("wireguard.target is required")
 	}
 	return nil
 }

@@ -7,13 +7,16 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/hysterguard/hysterguard/internal/config"
+	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -23,11 +26,10 @@ type ServerTunnel struct {
 	config *config.ServerConfig
 	logger *slog.Logger
 
-	tunDevice tun.Device
-	wgDevice  *device.Device
-
-	// HysteriaServerBind - 用于直接接收来自 Hysteria 的数据包
-	hysteriaBind *HysteriaServerBind
+	tunDevice  tun.Device
+	wgDevice   *device.Device
+	wgBind     conn.Bind // 标准 UDP 绑定
+	listenPort uint16    // 实际监听端口
 
 	mu     sync.RWMutex
 	closed atomic.Bool
@@ -43,12 +45,23 @@ func NewServerTunnel(cfg *config.ServerConfig, logger *slog.Logger) (*ServerTunn
 	}, nil
 }
 
-// Start 启动服务端隧道（包含 WireGuard）- 全内存方式，无需端口监听
+// Start 启动服务端隧道（包含 WireGuard）- 监听真实 UDP 端口
 func (t *ServerTunnel) Start(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.logger.Info("Starting WireGuard server (all-in-one mode)")
+	// 解析监听地址获取端口
+	listenAddr := t.config.WireGuard.Listen
+	_, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %s: %w", listenAddr, err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return fmt.Errorf("invalid port in listen address: %w", err)
+	}
+
+	t.logger.Info("Starting WireGuard server (local mode)", "listen", listenAddr)
 
 	// 1. 创建 TUN 设备
 	tunName := "wg0"
@@ -68,8 +81,8 @@ func (t *ServerTunnel) Start(ctx context.Context) error {
 		t.logger.Info("TUN device created", "name", realName)
 	}
 
-	// 2. 创建 HysteriaServerBind（内存通道，不监听端口）
-	t.hysteriaBind = NewHysteriaServerBind()
+	// 2. 创建标准 UDP 绑定（监听真实端口）
+	t.wgBind = conn.NewDefaultBind()
 
 	// 3. 创建 WireGuard 设备
 	wgLogger := &device.Logger{
@@ -81,15 +94,17 @@ func (t *ServerTunnel) Start(ctx context.Context) error {
 		},
 	}
 
-	wgDev := device.NewDevice(tunDev, t.hysteriaBind, wgLogger)
+	wgDev := device.NewDevice(tunDev, t.wgBind, wgLogger)
 	t.wgDevice = wgDev
 
-	// 4. 配置 WireGuard
+	// 4. 配置 WireGuard（包含监听端口）
 	ipcConfig, err := t.buildIpcConfig()
 	if err != nil {
 		tunDev.Close()
 		return fmt.Errorf("failed to build IPC config: %w", err)
 	}
+	// 添加监听端口配置
+	ipcConfig = fmt.Sprintf("listen_port=%d\n%s", port, ipcConfig)
 
 	t.logger.Debug("Applying WireGuard configuration")
 	if err := wgDev.IpcSet(ipcConfig); err != nil {
@@ -102,6 +117,9 @@ func (t *ServerTunnel) Start(ctx context.Context) error {
 		tunDev.Close()
 		return fmt.Errorf("failed to bring up WireGuard device: %w", err)
 	}
+
+	t.listenPort = uint16(port)
+	t.logger.Info("WireGuard listening on UDP port", "port", t.listenPort)
 
 	// 6. 配置 TUN 设备 IP 地址和路由
 	if err := t.configureTUNAddress(); err != nil {
@@ -118,16 +136,17 @@ func (t *ServerTunnel) Start(ctx context.Context) error {
 		ExecuteHooks(t.config.WireGuard.PostUp, t.logger, "PostUp")
 	}
 
-	t.logger.Info("WireGuard server started (no port listening - all-in-one)",
+	t.logger.Info("WireGuard server started (local mode)",
+		"listen", listenAddr,
 		"address", t.config.WireGuard.Address.IPv4,
 	)
 
 	return nil
 }
 
-// GetBind 获取 HysteriaServerBind（供 Hysteria 服务端使用）
-func (t *ServerTunnel) GetBind() *HysteriaServerBind {
-	return t.hysteriaBind
+// GetListenPort 获取实际监听的端口
+func (t *ServerTunnel) GetListenPort() uint16 {
+	return t.listenPort
 }
 
 // Stop 停止服务端隧道
@@ -154,9 +173,9 @@ func (t *ServerTunnel) Stop() error {
 		t.tunDevice = nil
 	}
 
-	if t.hysteriaBind != nil {
-		t.hysteriaBind.Close()
-		t.hysteriaBind = nil
+	if t.wgBind != nil {
+		t.wgBind.Close()
+		t.wgBind = nil
 	}
 
 	close(t.done)
